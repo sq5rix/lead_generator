@@ -41,3 +41,11 @@ Results are batched (5 at a time) to stay within context limits
 Deduplication by business name and URL
 Everything runs locally, no API keys needed
 
+lead-search/
+├── docker-compose.yml
+├── lead_search.py
+├── requirements.txt
+└── searxng/
+    └── settings.yml
+
+
