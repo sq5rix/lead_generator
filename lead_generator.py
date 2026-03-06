@@ -1,579 +1,641 @@
 #!/usr/bin/env python3
 """
-lead_search.py - Terminal-based lead generation tool
-Uses SearXNG for search + Ollama for extraction → CSV output
+Lead Scraper – Terminal-based, uses SearXNG + Ollama (local, open-source only).
+Searches for businesses, scrapes pages, extracts leads with EMAIL REQUIRED.
 """
 
-import requests
-import json
 import csv
-import time
-import sys
+import json
 import os
+import re
+import sys
+import time
 from datetime import datetime
+from urllib.parse import urlparse
 
+import requests
+from bs4 import BeautifulSoup
 
 # ============================================================
 # CONFIG
 # ============================================================
-
-SEARXNG_URL = os.getenv("SEARXNG_URL", "http://localhost:8888")
-
-# Ollama: local (Ubuntu native) or Docker
-# Native install: http://localhost:11434 (default)
-# Docker: http://localhost:11434 (mapped port) or http://ollama:11434 (compose network)
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+SEARXNG_URL = os.getenv("SEARXNG_URL", "http://localhost:8888/search")
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
 
-# Connection mode for reference
-# "local" = ollama installed on Ubuntu directly (default)
-# "docker" = ollama running in docker container
-OLLAMA_MODE = os.getenv("OLLAMA_MODE", "local")
+REQUEST_TIMEOUT = 15
+SCRAPE_TIMEOUT = 15
+MAX_CONTENT_LENGTH = 8000  # chars to send to Ollama
+DELAY_BETWEEN_REQUESTS = 2
 
-MAX_RESULTS = 6000
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+}
+
+# Domains to always skip
+SKIP_DOMAINS = [
+    "listsxpanders.com", "educationdatalists.com", "libro.fm",
+    "oxfordonlinepractice.com", "youtube.com", "facebook.com",
+    "yelp.com", "yellowpages.com", "linkedin.com", "wikipedia.org",
+    "amazon.com", "ebay.com", "reddit.com", "twitter.com",
+    "instagram.com", "tiktok.com", "pinterest.com", "tripadvisor.com",
+    "mapquest.com", "apple.com", "google.com", "googleapis.com",
+    "gov", "bbb.org", "crunchbase.com", "zoominfo.com",
+    "dnb.com", "hoovers.com", "manta.com", "infobel.com",
+    "superpages.com", "whitepages.com", "chamberofcommerce.com",
+    "graywolfpress.org", "candlewick.com", "chroniclebooks.com",
+    "ucpress.edu", "randomhouse.com", "penguinrandomhouse.com",
+    "harpercollins.com", "simonandschuster.com", "macmillan.com",
+    "hachette.com", "mpsvirginia.com",
+    "disney.com", "oxfordlearnersdictionaries.com", "independent.com",
+    "milkweed.org", "bookstores.com", "greatbooks.org",
+    "barnesandnoble.com", "bookshop.org", "thriftbooks.com",
+    "abebooks.com", "powells.com", "betterworldbooks.com",
+]
+
+# Data broker phrases in titles/descriptions
+JUNK_PHRASES = [
+    "mailing list", "email list", "buy leads", "data provider",
+    "b2b database", "marketing list", "lead generation",
+    "bulk email", "sales leads", "business database",
+    "publisher", "university press", "publishing house",
+    "newspaper", "dictionary", "online bookstore", "ebook",
+    "publishing", "press release",
+]
 
 REGION_MAP = {
-    "us": "us-en",
-    "uk": "gb-en",
-    "eu": "de-en",
-    "canada": "ca-en",
-    "au": "au-en",
+    "us": "us",
+    "uk": "gb",
+    "eu": "eu",
+    "canada": "ca",
+    "au": "au",
     "all": None,
 }
 
-EU_COUNTRIES = ["de-en", "fr-fr", "es-es", "it-it", "nl-nl", "pl-pl", "se-sv"]
-
-CSV_FIELDS = ["name", "email", "phone", "address", "website", "description", "source_url"]
-
 
 # ============================================================
-# OLLAMA API
+# SEARXNG SEARCH
 # ============================================================
+def search_searxng(query, region=None, max_results=30):
+    """Search SearXNG and return list of {url, title, snippet}."""
+    results = []
+    seen_urls = set()
+    pages_to_try = max(1, max_results // 10)
 
-def ollama_get(endpoint, timeout=10):
-    """GET request to Ollama API."""
-    try:
-        r = requests.get(f"{OLLAMA_URL}{endpoint}", timeout=timeout)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        print(f"  Ollama GET {endpoint} error: {e}")
-        return None
+    for page in range(1, pages_to_try + 1):
+        params = {
+            "q": query,
+            "format": "json",
+            "categories": "general",
+            "pageno": page,
+            "language": "en",
+        }
+        if region:
+            params["language"] = f"en-{region.upper()}"
+            params["region"] = region
+
+        try:
+            r = requests.get(SEARXNG_URL, params=params, timeout=REQUEST_TIMEOUT)
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:
+            print(f"  [!] SearXNG error page {page}: {e}")
+            break
+
+        page_results = data.get("results", [])
+        if not page_results:
+            break
+
+        for item in page_results:
+            url = item.get("url", "")
+            if not url or url in seen_urls:
+                continue
+            if should_skip_url(url):
+                continue
+
+            title = item.get("title", "")
+            snippet = item.get("content", "")
+
+            # Skip data broker junk
+            combined = (title + " " + snippet).lower()
+            if any(phrase in combined for phrase in JUNK_PHRASES):
+                print(f"  Skipped data broker: {title[:50]}")
+                continue
+
+            seen_urls.add(url)
+            results.append({
+                "url": url,
+                "title": title,
+                "snippet": snippet,
+            })
+
+        time.sleep(DELAY_BETWEEN_REQUESTS)
+
+    return results[:max_results]
+
+def build_search_queries(business_type, location):
+    """Queries targeting actual local stores with contact info."""
+    queries = [
+        f'"{business_type}" {location} "contact us" email site:.com',
+        f'independent {business_type} {location} "@gmail.com" OR "@yahoo.com"',
+        f'local {business_type} shop {location} email phone address',
+        f'indie {business_type} {location} "info@" OR "contact@"',
+        f'{business_type} {location} "hours" "email" "phone" -publisher -press -wholesale',
+        f'neighborhood {business_type} store {location} email',
+        f'used {business_type} {location} contact email',
+    ]
+    return queries
 
 
-def ollama_post(endpoint, payload, timeout=120):
-    """POST request to Ollama API."""
-    try:
-        r = requests.post(f"{OLLAMA_URL}{endpoint}", json=payload, timeout=timeout)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        print(f"  Ollama POST {endpoint} error: {e}")
-        return None
-
-
-def ollama_is_up():
-    """Check if Ollama is reachable."""
-    data = ollama_get("/api/tags", timeout=5)
-    return data is not None
-
-
-def ollama_list_models():
-    """List all available models. Returns list of model names."""
-    data = ollama_get("/api/tags")
-    if not data:
-        return []
-    models = data.get("models", [])
-    return [m.get("name", "") for m in models]
-
-
-def ollama_has_model(model_name):
-    """Check if a specific model is available."""
-    models = ollama_list_models()
-    # match with or without tag
-    for m in models:
-        if m == model_name or m.startswith(model_name + ":"):
+def should_skip_url(url):
+    """Skip known junk domains."""
+    url_lower = url.lower()
+    for domain in SKIP_DOMAINS:
+        if domain in url_lower:
             return True
     return False
 
 
-def ollama_pull_model(model_name):
-    """Pull a model. Returns True on success."""
-    print(f"  Pulling model '{model_name}'... (this may take a while)")
+# ============================================================
+# WEB SCRAPING
+# ============================================================
+def scrape_page(url):
+    """Scrape a single page, return cleaned text."""
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=SCRAPE_TIMEOUT, allow_redirects=True)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        # Remove scripts, styles, nav, footer junk
+        for tag in soup(["script", "style", "nav", "header", "footer", "noscript", "svg", "img"]):
+            tag.decompose()
+
+        text = soup.get_text(separator="\n", strip=True)
+        # Collapse whitespace
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        text = re.sub(r' {2,}', ' ', text)
+        return text[:MAX_CONTENT_LENGTH]
+    except Exception as e:
+        return ""
+
+
+def get_contact_urls(base_url):
+    """Generate possible contact page URLs from a base URL."""
+    try:
+        parsed = urlparse(base_url)
+        domain = f"{parsed.scheme}://{parsed.netloc}"
+    except:
+        return [base_url]
+
+    contact_paths = [
+        "", "/contact", "/contact-us", "/about", "/about-us",
+        "/info", "/connect", "/reach-us", "/get-in-touch",
+    ]
+
+    urls = []
+    for path in contact_paths:
+        urls.append(f"{domain}{path}")
+    return urls
+
+
+def scrape_with_contact_pages(base_url):
+    """Scrape the main page + contact/about pages, combine text."""
+    all_text = []
+    urls_tried = set()
+
+    contact_urls = get_contact_urls(base_url)
+
+    for url in contact_urls:
+        if url in urls_tried:
+            continue
+        urls_tried.add(url)
+
+        text = scrape_page(url)
+        if text and len(text) > 100:
+            all_text.append(f"--- PAGE: {url} ---\n{text}")
+
+        time.sleep(0.5)
+
+        # Don't scrape too many pages
+        if len(all_text) >= 3:
+            break
+
+    combined = "\n\n".join(all_text)
+    return combined[:MAX_CONTENT_LENGTH * 2]
+
+
+def extract_emails_from_text(text):
+    """Regex extract emails from raw text as fallback."""
+    if not text:
+        return []
+    pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+    emails = re.findall(pattern, text)
+    # Filter junk emails
+    junk = ["example.com", "sentry.io", "wixpress.com", "w3.org", "schema.org",
+            "googleapis.com", "cloudflare.com", "wordpress.com", "gravatar.com",
+            ".png", ".jpg", ".gif", ".svg", ".css", ".js"]
+    cleaned = []
+    for e in emails:
+        e_lower = e.lower()
+        if any(j in e_lower for j in junk):
+            continue
+        if e_lower not in cleaned:
+            cleaned.append(e_lower)
+    return cleaned
+
+
+# ============================================================
+# OLLAMA EXTRACTION
+# ============================================================
+def extract_with_ollama(page_text, business_type, source_url):
+    """Send scraped text to Ollama to extract structured lead data."""
+
+    # First do regex email extraction as backup
+    regex_emails = extract_emails_from_text(page_text)
+
+    email_hint = ""
+    if regex_emails:
+        email_hint = f"\nEmails found on page: {', '.join(regex_emails[:10])}"
+
+    prompt = f"""Extract business contact information from this webpage text.
+I need: business name, email, phone, physical address, website, short description.
+
+Business type I'm looking for: {business_type}
+Source URL: {source_url}
+{email_hint}
+
+RULES:
+- Only extract REAL businesses, not directories or data brokers
+- Email is REQUIRED - if no email found, return empty JSON array
+- Each business must be a separate entry
+- Return ONLY valid JSON array, nothing else
+- If multiple businesses found, return all of them
+
+Return format:
+[
+  {{
+    "name": "Business Name",
+    "email": "real@email.com",
+    "phone": "phone number or not found",
+    "address": "full address or not found",
+    "website": "website.com",
+    "description": "what they do in 10 words or less"
+  }}
+]
+
+If NO business with email found, return: []
+
+PAGE TEXT:
+{page_text[:MAX_CONTENT_LENGTH]}
+"""
+
     try:
         r = requests.post(
-            f"{OLLAMA_URL}/api/pull",
-            json={"name": model_name},
-            timeout=600,
-            stream=True,
+            OLLAMA_URL,
+            json={
+                "model": OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0.1,
+                    "num_predict": 2000,
+                }
+            },
+            timeout=120,
         )
         r.raise_for_status()
-        # stream progress
-        for line in r.iter_lines():
-            if line:
-                try:
-                    data = json.loads(line)
-                    status = data.get("status", "")
-                    if "pulling" in status or "download" in status.lower():
-                        pct = data.get("completed", 0)
-                        total = data.get("total", 0)
-                        if total > 0:
-                            print(f"\r  {status}: {pct}/{total} ({int(pct/total*100)}%)", end="")
-                    else:
-                        print(f"\r  {status}                    ", end="")
-                except json.JSONDecodeError:
-                    pass
-        print()
-        return True
+        response_text = r.json().get("response", "")
+        return parse_ollama_response(response_text, regex_emails, source_url)
+
     except Exception as e:
-        print(f"  Pull error: {e}")
-        return False
-
-
-def ollama_generate(prompt, model=None, temperature=0.1):
-    """Generate a response from Ollama. Returns response text or empty string."""
-    model = model or OLLAMA_MODEL
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "stream": False,
-        "options": {
-            "temperature": temperature,
-        },
-    }
-    data = ollama_post("/api/generate", payload, timeout=120)
-    if data:
-        return data.get("response", "")
-    return ""
-
-
-def ollama_model_info(model_name=None):
-    """Get model info. Returns dict or None."""
-    model_name = model_name or OLLAMA_MODEL
-    return ollama_post("/api/show", {"name": model_name}, timeout=10)
-
-
-def ollama_status():
-    """Print Ollama status: connection, mode, models."""
-    up = ollama_is_up()
-    print(f"  Ollama URL:    {OLLAMA_URL}")
-    print(f"  Ollama Mode:   {OLLAMA_MODE}")
-    print(f"  Ollama Status: {'OK' if up else 'NOT REACHABLE'}")
-
-    if up:
-        models = ollama_list_models()
-        print(f"  Models:        {', '.join(models) if models else 'none'}")
-        has_model = ollama_has_model(OLLAMA_MODEL)
-        print(f"  Target Model:  {OLLAMA_MODEL} ({'available' if has_model else 'NOT FOUND'})")
-    return up
-
-
-def ensure_model():
-    """Make sure the configured model is available, pull if not."""
-    if ollama_has_model(OLLAMA_MODEL):
-        return True
-
-    print(f"\n  Model '{OLLAMA_MODEL}' not found.")
-    pull = input(f"  Pull it now? (y/n) [y]: ").strip().lower()
-    if pull == "n":
-        print("  Cannot continue without model.")
-        return False
-
-    return ollama_pull_model(OLLAMA_MODEL)
-
-
-# ============================================================
-# SERVICE CHECKS
-# ============================================================
-
-def is_searxng_up():
-    """Check if SearXNG is reachable."""
-    try:
-        r = requests.get(f"{SEARXNG_URL}/healthz", timeout=5)
-        return r.status_code == 200
-    except Exception:
-        return False
-
-
-def check_services():
-    """Check both services, print status, return True if both OK."""
-    print("\nChecking services...")
-
-    searx_ok = is_searxng_up()
-    print(f"  SearXNG: {'OK' if searx_ok else 'NOT REACHABLE at ' + SEARXNG_URL}")
-
-    ollama_ok = ollama_status()
-
-    if not searx_ok:
-        print("\n  Start SearXNG: docker compose up -d searxng")
-
-    if not ollama_ok:
-        if OLLAMA_MODE == "local":
-            print("\n  Start Ollama: ollama serve")
-        else:
-            print("\n  Start Ollama: docker compose up -d ollama")
-
-    if not searx_ok or not ollama_ok:
-        return False
-
-    # make sure model is pulled
-    if not ensure_model():
-        return False
-
-    return True
-
-
-# ============================================================
-# USER INPUT
-# ============================================================
-
-def get_query():
-    """Ask user for search query."""
-    print()
-    query = input("What to search for: ").strip()
-    if not query:
-        print("No query entered.")
-        return None
-    return query
-
-
-def get_region():
-    """Ask user for region selection."""
-    print()
-    print("Regions: us, uk, eu, canada, au, all")
-    region = input("Region [all]: ").strip().lower()
-    if not region:
-        region = "all"
-    if region not in REGION_MAP:
-        print(f"Unknown region '{region}', using 'all'.")
-        region = "all"
-    return region
-
-
-def get_num_results():
-    """Ask user how many results to fetch."""
-    print()
-    num_str = input("Number of results [20]: ").strip()
-    if not num_str:
-        return 20
-    try:
-        num = int(num_str)
-        return max(1, min(num, MAX_RESULTS))
-    except ValueError:
-        print("Invalid number, using 20.")
-        return 20
-
-
-def collect_user_input():
-    """Gather all user inputs. Returns (query, region, num_results) or None."""
-    query = get_query()
-    if not query:
-        return None
-
-    region = get_region()
-    num_results = get_num_results()
-
-    print()
-    print(f"  Query:   {query}")
-    print(f"  Region:  {region}")
-    print(f"  Results: {num_results}")
-    print()
-
-    confirm = input("Proceed? (y/n) [y]: ").strip().lower()
-    if confirm == "n":
-        print("Cancelled.")
-        return None
-
-    return query, region, num_results
-
-
-# ============================================================
-# SEARCH (SearXNG)
-# ============================================================
-
-def search_searxng(query, language=None, page=1):
-    """Run a single search query against SearXNG. Returns list of results."""
-    params = {
-        "q": query,
-        "format": "json",
-        "pageno": page,
-    }
-    if language:
-        params["language"] = language
-
-    try:
-        r = requests.get(f"{SEARXNG_URL}/search", params=params, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        return data.get("results", [])
-    except Exception as e:
-        print(f"  Search error: {e}")
+        print(f"  [!] Ollama error: {e}")
+        # Fallback: if we found emails via regex, create basic leads
+        if regex_emails:
+            return create_fallback_leads(regex_emails, source_url)
         return []
 
 
-def build_search_queries(base_query, region):
-    """Build list of (query_string, language_code) tuples based on region."""
-    contact_suffixes = ["email", "contact", "phone number", "address"]
-    queries = []
+def parse_ollama_response(text, regex_emails, source_url):
+    """Parse JSON from Ollama response."""
+    # Find JSON array in response
+    text = text.strip()
 
-    if region == "eu":
-        languages = EU_COUNTRIES
-    else:
-        languages = [REGION_MAP.get(region)]
-
-    for lang in languages:
-        for suffix in contact_suffixes:
-            full_query = f"{base_query} {suffix}"
-            queries.append((full_query, lang))
-
-    return queries
-
-
-def run_search(query, region, num_results):
-    """Execute all searches and return deduplicated raw results."""
-    search_queries = build_search_queries(query, region)
-    all_results = []
-    seen_urls = set()
-
-    print(f"Running {len(search_queries)} search queries...")
-
-    for i, (q, lang) in enumerate(search_queries):
-        print(f"  [{i + 1}/{len(search_queries)}] {q[:60]}...")
-        results = search_searxng(q, language=lang)
-
-        for r in results:
-            url = r.get("url", "")
-            if url and url not in seen_urls:
-                seen_urls.add(url)
-                all_results.append(r)
-
-        time.sleep(1)
-
-        if len(all_results) >= num_results * 3:
-            break
-
-    print(f"  Total raw results: {len(all_results)}")
-    return all_results
-
-
-# ============================================================
-# EXTRACTION (Ollama)
-# ============================================================
-
-def format_results_for_prompt(results):
-    """Convert raw search results into a text block for the LLM."""
-    lines = []
-    for i, r in enumerate(results, 1):
-        title = r.get("title", "N/A")
-        url = r.get("url", "N/A")
-        snippet = r.get("content", "N/A")
-        lines.append(f"Result {i}:")
-        lines.append(f"  Title: {title}")
-        lines.append(f"  URL: {url}")
-        lines.append(f"  Snippet: {snippet}")
-        lines.append("")
-    return "\n".join(lines)
-
-
-def build_extraction_prompt(results_text):
-    """Build the prompt that asks Ollama to extract leads."""
-    return f"""Extract business leads from these search results.
-For each business found, extract:
-- name: business name
-- email: email address (or "not found")
-- phone: phone number (or "not found")
-- address: physical address (or "not found")
-- website: website URL
-- description: one line description
-
-Return ONLY a JSON array. No explanation. No markdown.
-Example: [{{"name":"Shop A","email":"a@b.com","phone":"123","address":"1 Main St","website":"http://shop.com","description":"A book shop"}}]
-
-Search results:
-{results_text}"""
-
-
-def parse_llm_json(response_text):
-    """Try to parse JSON array from LLM response. Returns list of dicts."""
-    text = response_text.strip()
-
-    start = text.find("[")
-    end = text.rfind("]")
+    # Try to find JSON array
+    start = text.find('[')
+    end = text.rfind(']')
 
     if start == -1 or end == -1:
+        if regex_emails:
+            return create_fallback_leads(regex_emails, source_url)
         return []
 
     json_str = text[start:end + 1]
 
     try:
-        data = json.loads(json_str)
-        if isinstance(data, list):
-            return data
+        leads = json.loads(json_str)
+        if isinstance(leads, list):
+            return leads
     except json.JSONDecodeError:
-        pass
+        # Try to fix common JSON issues
+        json_str = json_str.replace("'", '"')
+        json_str = re.sub(r',\s*]', ']', json_str)
+        json_str = re.sub(r',\s*}', '}', json_str)
+        try:
+            leads = json.loads(json_str)
+            if isinstance(leads, list):
+                return leads
+        except:
+            pass
 
+    if regex_emails:
+        return create_fallback_leads(regex_emails, source_url)
     return []
 
 
-def chunk_list(lst, size):
-    """Split a list into chunks of given size."""
-    for i in range(0, len(lst), size):
-        yield lst[i:i + size]
-
-
-def extract_leads(raw_results):
-    """Send results to Ollama in batches and extract structured leads."""
-    all_leads = []
-    batches = list(chunk_list(raw_results, 5))
-
-    print(f"Extracting leads from {len(raw_results)} results ({len(batches)} batches)...")
-
-    for i, batch in enumerate(batches):
-        print(f"  Batch [{i + 1}/{len(batches)}]...")
-
-        results_text = format_results_for_prompt(batch)
-        prompt = build_extraction_prompt(results_text)
-        response = ollama_generate(prompt)
-        leads = parse_llm_json(response)
-
-        for lead in leads:
-            if "source_url" not in lead:
-                lead["source_url"] = batch[0].get("url", "") if batch else ""
-
-        all_leads.extend(leads)
-        print(f"    Found {len(leads)} leads")
-
-    return all_leads
+def create_fallback_leads(emails, source_url, business_type=""):
+    """Create basic lead entries from regex-extracted emails.
+    Only keep ONE email per domain, skip if source doesn't match business type."""
+    domain = clean_website(source_url)
+    
+    # Filter: keep only emails matching the source domain (skip random @randomhouse.com etc)
+    domain_emails = [e for e in emails if domain and domain.split('.')[0] in e]
+    # If none match domain, just take the first one
+    if not domain_emails:
+        domain_emails = emails[:1]
+    
+    # Only keep first email per source (one lead per business)
+    email = domain_emails[0] if domain_emails else None
+    if not email:
+        return []
+    
+    return [{
+        "name": domain or "Unknown",
+        "email": email,
+        "phone": "not found",
+        "address": "not found",
+        "website": domain,
+        "description": "Auto-extracted from page",
+    }]
 
 
 # ============================================================
-# DEDUPLICATION
+# LEAD VALIDATION & CLEANING
 # ============================================================
+def clean_website(url):
+    """Extract clean domain from URL."""
+    if not url or url == "not found":
+        return "not found"
+    url = re.sub(r'^https?://', '', url)
+    url = re.sub(r'^www\.', '', url)
+    url = url.split('/')[0]
+    url = url.split('?')[0]
+    url = url.split('#')[0]
+    return url.strip().lower()
 
-def deduplicate_leads(leads):
-    """Remove duplicate leads by name (case-insensitive)."""
-    seen = set()
-    unique = []
+
+def is_valid_email(email):
+    """Check if email looks real."""
+    if not email or email == "not found":
+        return False
+    email = email.strip().lower()
+    pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    if not re.match(pattern, email):
+        return False
+    # Skip junk emails
+    junk_domains = [
+        "example.com", "test.com", "sentry.io", "wixpress.com",
+        "w3.org", "schema.org", "googleapis.com", "cloudflare.com",
+        "wordpress.com", "gravatar.com", "yoursite.com", "email.com",
+        "domain.com", "website.com", "company.com",
+    ]
+    domain = email.split('@')[1]
+    if domain in junk_domains:
+        return False
+    return True
+
+
+def validate_leads(leads, source_url=""):
+    """Filter and clean leads. Email is REQUIRED."""
+    valid = []
+    seen_emails = set()
 
     for lead in leads:
-        name = lead.get("name", "").strip().lower()
-        if name and name not in seen:
-            seen.add(name)
-            unique.append(lead)
+        if not isinstance(lead, dict):
+            continue
 
-    removed = len(leads) - len(unique)
-    if removed > 0:
-        print(f"  Removed {removed} duplicates")
+        name = str(lead.get("name", "not found")).strip()
+        email = str(lead.get("email", "not found")).strip().lower()
+        phone = str(lead.get("phone", "not found")).strip()
+        address = str(lead.get("address", "not found")).strip()
+        website = str(lead.get("website", "not found")).strip()
+        description = str(lead.get("description", "not found")).strip()
 
-    return unique
+        # MUST have valid email
+        if not is_valid_email(email):
+            print(f"    Dropped (no valid email): {name}")
+            continue
+
+        # Deduplicate by email
+        if email in seen_emails:
+            print(f"    Dropped (duplicate): {email}")
+            continue
+        seen_emails.add(email)
+
+        # Clean website to domain only
+        website = clean_website(website)
+        if website == "not found" and source_url:
+            website = clean_website(source_url)
+
+        valid.append({
+            "name": name,
+            "email": email,
+            "phone": phone,
+            "address": address,
+            "website": website,
+            "description": description,
+            "source_url": source_url,
+        })
+
+    return valid
 
 
 # ============================================================
 # CSV OUTPUT
 # ============================================================
-
-def build_filename(query, region):
-    """Generate a CSV filename from query and region."""
-    safe_query = query[:30].replace(" ", "_").replace("/", "_")
+def save_to_csv(leads, business_type, region):
+    """Save leads to CSV file."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return f"leads_{safe_query}_{region}_{timestamp}.csv"
+    safe_type = re.sub(r'[^a-zA-Z0-9]', '_', business_type.lower())
+    filename = f"leads_{safe_type}_{region}_{timestamp}.csv"
 
-
-def save_csv(leads, query, region):
-    """Save leads to a CSV file. Returns filename or None."""
-    if not leads:
-        print("No leads to save.")
-        return None
-
-    filename = build_filename(query, region)
+    fieldnames = ["name", "email", "phone", "address", "website", "description", "source_url"]
 
     with open(filename, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for lead in leads:
             writer.writerow(lead)
 
-    print(f"  Saved {len(leads)} leads to {filename}")
     return filename
-
-
-# ============================================================
-# STATS / SUMMARY
-# ============================================================
-
-def print_summary(leads, filename):
-    """Print a summary of the results."""
-    print()
-    print("=" * 60)
-    print("  DONE")
-
-    if not leads or not filename:
-        print("  No leads found.")
-        print("=" * 60)
-        return
-
-    print(f"  File:        {filename}")
-    print(f"  Total leads: {len(leads)}")
-
-    emails = sum(1 for l in leads if l.get("email", "").lower() not in ("", "not found"))
-    phones = sum(1 for l in leads if l.get("phone", "").lower() not in ("", "not found"))
-
-    print(f"  With email:  {emails}")
-    print(f"  With phone:  {phones}")
-    print("=" * 60)
 
 
 # ============================================================
 # MAIN
 # ============================================================
-
-def run_pipeline():
-    """Run one full search → extract → save cycle."""
-    user_input = collect_user_input()
-    if not user_input:
-        return
-
-    query, region, num_results = user_input
-
-    print()
-    print("[1/3] Searching...")
-    raw_results = run_search(query, region, num_results)
-
-    if not raw_results:
-        print("No search results found. Try a different query.")
-        return
-
-    print()
-    print("[2/3] Extracting leads with Ollama...")
-    leads = extract_leads(raw_results)
-    leads = deduplicate_leads(leads)
-
-    print()
-    print("[3/3] Saving CSV...")
-    filename = save_csv(leads, query, region)
-
-    print_summary(leads, filename)
-
-
 def main():
-    """Entry point with service check and loop."""
-    print()
     print("=" * 60)
-    print("  LEAD SEARCH TOOL")
-    print("  SearXNG + Ollama → CSV")
+    print("  LEAD SCRAPER")
+    print("  SearXNG + Ollama (100% local & open source)")
     print("=" * 60)
 
-    if not check_services():
+    # Check services
+    print("\nChecking services...")
+    try:
+        requests.get(SEARXNG_URL.replace("/search", "/"), timeout=5)
+        print("  ✓ SearXNG OK")
+    except:
+        print("  ✗ SearXNG not reachable at", SEARXNG_URL)
+        print("    Start it: docker-compose up -d")
         sys.exit(1)
 
-    while True:
-        run_pipeline()
+    try:
+        requests.get(OLLAMA_URL.replace("/api/generate", "/"), timeout=5)
+        print("  ✓ Ollama OK")
+    except:
+        print("  ✗ Ollama not reachable at", OLLAMA_URL)
+        print("    Start it: ollama serve")
+        sys.exit(1)
 
-        print()
-        again = input("Search again? (y/n) [n]: ").strip().lower()
-        if again != "y":
-            print("Bye.")
+    # User input
+    print()
+    business_type = input("What to search for (e.g. 'bookstores'): ").strip()
+    if not business_type:
+        print("Need a search term!")
+        sys.exit(1)
+
+    print(f"\nRegions: us, uk, eu, canada, au, all")
+    region_input = input("Region [us]: ").strip().lower() or "us"
+    region = REGION_MAP.get(region_input, "us")
+
+    max_leads = input("Max leads to find [50]: ").strip()
+    max_leads = int(max_leads) if max_leads.isdigit() else 50
+
+    # Location text for queries
+    location_names = {
+        "us": "United States",
+        "gb": "United Kingdom",
+        "eu": "Europe",
+        "ca": "Canada",
+        "au": "Australia",
+        None: "",
+    }
+    location = location_names.get(region, region_input)
+
+    print(f"\n{'=' * 60}")
+    print(f"  Searching: {business_type}")
+    print(f"  Region:    {location or 'worldwide'}")
+    print(f"  Max leads: {max_leads}")
+    print(f"{'=' * 60}\n")
+
+    # Build and run queries
+    queries = build_search_queries(business_type, location)
+    all_search_results = []
+    seen_urls = set()
+
+    for i, query in enumerate(queries, 1):
+        print(f"[{i}/{len(queries)}] Searching: {query[:70]}...")
+        results = search_searxng(query, region, max_results=20)
+        for r in results:
+            if r["url"] not in seen_urls:
+                seen_urls.add(r["url"])
+                all_search_results.append(r)
+        print(f"  Found {len(results)} results ({len(all_search_results)} total unique)")
+        time.sleep(DELAY_BETWEEN_REQUESTS)
+
+    if not all_search_results:
+        print("\nNo search results found. Check SearXNG config.")
+        sys.exit(1)
+
+    print(f"\nTotal unique URLs to process: {len(all_search_results)}")
+
+    # Process each URL
+    all_leads = []
+    seen_emails = set()
+
+    for i, result in enumerate(all_search_results, 1):
+        if len(all_leads) >= max_leads:
+            print(f"\nReached {max_leads} leads, stopping.")
             break
+
+        url = result["url"]
+        title = result["title"][:60]
+        print(f"\n[{i}/{len(all_search_results)}] {title}")
+        print(f"  URL: {url[:80]}")
+
+        # Scrape main page + contact pages
+        print(f"  Scraping (+ contact pages)...")
+        page_text = scrape_with_contact_pages(url)
+
+        if not page_text or len(page_text) < 100:
+            print(f"  Skipped (no content)")
+            continue
+
+        # Quick check: any emails on page at all?
+        quick_emails = extract_emails_from_text(page_text)
+        if not quick_emails:
+            print(f"  Skipped (no emails found on page)")
+            continue
+
+        print(f"  Found {len(quick_emails)} email(s) on page, extracting with Ollama...")
+
+        # Extract with Ollama
+        leads = extract_with_ollama(page_text, business_type, url)
+
+        if not leads:
+            print(f"  No leads extracted")
+            continue
+
+        # Validate
+        leads = validate_leads(leads, source_url=url)
+
+        # Deduplicate against master list
+        new_leads = []
+        for lead in leads:
+            if lead["email"] not in seen_emails:
+                seen_emails.add(lead["email"])
+                new_leads.append(lead)
+                print(f"  ✓ {lead['name']} | {lead['email']} | {lead['website']}")
+            else:
+                print(f"    Duplicate: {lead['email']}")
+
+        all_leads.extend(new_leads)
+        print(f"  Running total: {len(all_leads)} leads")
+
+        time.sleep(DELAY_BETWEEN_REQUESTS)
+
+    # Save results
+    if not all_leads:
+        print("\n" + "=" * 60)
+        print("  No leads found. Try different search terms.")
+        print("=" * 60)
+        sys.exit(0)
+
+    filename = save_to_csv(all_leads, business_type, region_input)
+
+    # Summary
+    emails = sum(1 for l in all_leads if l["email"] != "not found")
+    phones = sum(1 for l in all_leads if l["phone"] != "not found")
+    addresses = sum(1 for l in all_leads if l["address"] != "not found")
+
+    print(f"\n{'=' * 60}")
+    print(f"  DONE")
+    print(f"  File:        {filename}")
+    print(f"  Total leads: {len(all_leads)}")
+    print(f"  With email:  {emails}")
+    print(f"  With phone:  {phones}")
+    print(f"  With address:{addresses}")
+    print(f"{'=' * 60}")
 
 
 if __name__ == "__main__":
