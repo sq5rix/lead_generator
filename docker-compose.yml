@@ -1,26 +1,11 @@
-# searxng/settings.yml
-use_default_settings: true
-
-server:
-  secret_key: "your-secret-key-change-this-1234567890"
-  bind_address: "0.0.0.0"
-  port: 8080
-
-search:
-  formats:
-    - html
-    - json
-
-engines:
-  - name: google
-    engine: google
-    shortcut: g
-    disabled: false
-  - name: bing
-    engine: bing
-    shortcut: b
-    disabled: false
-  - name: duckduckgo
-    engine: duckduckgo
-    shortcut: ddg
-    disabled: false
+services:
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    ports:
+      - "8888:8080"
+    volumes:
+      - ./searxng:/etc/searxng
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8888/
+    restart: unless-stopped
