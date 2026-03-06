@@ -2,6 +2,7 @@
 """
 Lead Scraper – Terminal-based, uses SearXNG + Ollama (local, open-source only).
 Searches for businesses, scrapes pages, extracts leads with EMAIL REQUIRED.
+Now uses Llama to generate smart search queries.
 """
 
 import csv
@@ -25,7 +26,7 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
 
 REQUEST_TIMEOUT = 15
 SCRAPE_TIMEOUT = 15
-MAX_CONTENT_LENGTH = 8000  # chars to send to Ollama
+MAX_CONTENT_LENGTH = 8000
 DELAY_BETWEEN_REQUESTS = 2
 
 HEADERS = {
@@ -33,7 +34,6 @@ HEADERS = {
                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
-# Domains to always skip
 SKIP_DOMAINS = [
     "listsxpanders.com", "educationdatalists.com", "libro.fm",
     "oxfordonlinepractice.com", "youtube.com", "facebook.com",
@@ -54,7 +54,6 @@ SKIP_DOMAINS = [
     "abebooks.com", "powells.com", "betterworldbooks.com",
 ]
 
-# Data broker phrases in titles/descriptions
 JUNK_PHRASES = [
     "mailing list", "email list", "buy leads", "data provider",
     "b2b database", "marketing list", "lead generation",
@@ -72,6 +71,93 @@ REGION_MAP = {
     "au": "au",
     "all": None,
 }
+
+
+# ============================================================
+# LLAMA QUERY GENERATION
+# ============================================================
+def llama_build_queries(business_type, location, num_queries=7):
+    """Use Llama via Ollama to generate targeted Google search queries."""
+
+    prompt = f"""You are a search expert. Generate exactly {num_queries} Google search queries
+to find REAL LOCAL {business_type} in {location} that have email addresses and contact
+information on their own websites.
+
+RULES:
+- Target independent, local, brick-and-mortar {business_type} ONLY
+- Each query MUST include terms that help find email addresses on pages
+- Use Google search operators: "exact phrases", OR, -exclude
+- Exclude: publishers, wholesalers, directories, big chains, aggregator sites
+- Vary the queries: some for contact pages, some for about pages, some for store listings
+- Include negative keywords like -amazon -yelp -yellowpages -wikipedia -facebook
+- Some queries should target "@gmail.com" OR "@yahoo.com" OR "info@" OR "contact@"
+- Some queries should include "contact us" or "about us" or "hours"
+
+RETURN ONLY the {num_queries} queries, one per line.
+No numbering, no bullets, no explanation, no blank lines.
+Just the raw search queries."""
+
+    try:
+        print("  [Llama] Generating smart search queries...")
+        r = requests.post(
+            OLLAMA_URL,
+            json={
+                "model": OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0.7,
+                    "num_predict": 1000,
+                }
+            },
+            timeout=60,
+        )
+        r.raise_for_status()
+        response_text = r.json().get("response", "")
+
+        # Parse: one query per line, skip blanks and junk
+        raw_lines = response_text.strip().split("\n")
+        queries = []
+        for line in raw_lines:
+            line = line.strip()
+            # Remove numbering like "1." or "1)" or "- " or "* "
+            line = re.sub(r'^[\d]+[.)]\s*', '', line)
+            line = re.sub(r'^[-*•]\s*', '', line)
+            line = line.strip()
+            # Skip blank or too-short lines
+            if len(line) < 10:
+                continue
+            # Skip lines that look like explanations
+            if any(word in line.lower() for word in ["here are", "these queries", "note:", "explanation", "this query"]):
+                continue
+            queries.append(line)
+
+        if queries:
+            print(f"  [Llama] Generated {len(queries)} queries:")
+            for i, q in enumerate(queries, 1):
+                print(f"    {i}. {q[:80]}")
+            return queries[:num_queries]
+        else:
+            print("  [Llama] No valid queries parsed, using fallback")
+            return fallback_queries(business_type, location)
+
+    except Exception as e:
+        print(f"  [Llama] Query generation failed: {e}")
+        print("  [Llama] Using fallback queries")
+        return fallback_queries(business_type, location)
+
+
+def fallback_queries(business_type, location):
+    """Backup queries if Llama is unavailable."""
+    return [
+        f'"{business_type}" {location} "contact us" email site:.com',
+        f'independent {business_type} {location} "@gmail.com" OR "@yahoo.com"',
+        f'local {business_type} shop {location} email phone address',
+        f'indie {business_type} {location} "info@" OR "contact@"',
+        f'{business_type} {location} "hours" "email" "phone" -publisher -press -wholesale',
+        f'neighborhood {business_type} store {location} email',
+        f'used {business_type} {location} contact email',
+    ]
 
 
 # ============================================================
@@ -117,7 +203,6 @@ def search_searxng(query, region=None, max_results=30):
             title = item.get("title", "")
             snippet = item.get("content", "")
 
-            # Skip data broker junk
             combined = (title + " " + snippet).lower()
             if any(phrase in combined for phrase in JUNK_PHRASES):
                 print(f"  Skipped data broker: {title[:50]}")
@@ -133,19 +218,6 @@ def search_searxng(query, region=None, max_results=30):
         time.sleep(DELAY_BETWEEN_REQUESTS)
 
     return results[:max_results]
-
-def build_search_queries(business_type, location):
-    """Queries targeting actual local stores with contact info."""
-    queries = [
-        f'"{business_type}" {location} "contact us" email site:.com',
-        f'independent {business_type} {location} "@gmail.com" OR "@yahoo.com"',
-        f'local {business_type} shop {location} email phone address',
-        f'indie {business_type} {location} "info@" OR "contact@"',
-        f'{business_type} {location} "hours" "email" "phone" -publisher -press -wholesale',
-        f'neighborhood {business_type} store {location} email',
-        f'used {business_type} {location} contact email',
-    ]
-    return queries
 
 
 def should_skip_url(url):
@@ -167,12 +239,10 @@ def scrape_page(url):
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
 
-        # Remove scripts, styles, nav, footer junk
         for tag in soup(["script", "style", "nav", "header", "footer", "noscript", "svg", "img"]):
             tag.decompose()
 
         text = soup.get_text(separator="\n", strip=True)
-        # Collapse whitespace
         text = re.sub(r'\n{3,}', '\n\n', text)
         text = re.sub(r' {2,}', ' ', text)
         return text[:MAX_CONTENT_LENGTH]
@@ -217,7 +287,6 @@ def scrape_with_contact_pages(base_url):
 
         time.sleep(0.5)
 
-        # Don't scrape too many pages
         if len(all_text) >= 3:
             break
 
@@ -231,7 +300,6 @@ def extract_emails_from_text(text):
         return []
     pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
     emails = re.findall(pattern, text)
-    # Filter junk emails
     junk = ["example.com", "sentry.io", "wixpress.com", "w3.org", "schema.org",
             "googleapis.com", "cloudflare.com", "wordpress.com", "gravatar.com",
             ".png", ".jpg", ".gif", ".svg", ".css", ".js"]
@@ -250,8 +318,6 @@ def extract_emails_from_text(text):
 # ============================================================
 def extract_with_ollama(page_text, business_type, source_url):
     """Send scraped text to Ollama to extract structured lead data."""
-
-    # First do regex email extraction as backup
     regex_emails = extract_emails_from_text(page_text)
 
     email_hint = ""
@@ -310,7 +376,6 @@ PAGE TEXT:
 
     except Exception as e:
         print(f"  [!] Ollama error: {e}")
-        # Fallback: if we found emails via regex, create basic leads
         if regex_emails:
             return create_fallback_leads(regex_emails, source_url)
         return []
@@ -318,10 +383,8 @@ PAGE TEXT:
 
 def parse_ollama_response(text, regex_emails, source_url):
     """Parse JSON from Ollama response."""
-    # Find JSON array in response
     text = text.strip()
 
-    # Try to find JSON array
     start = text.find('[')
     end = text.rfind(']')
 
@@ -337,7 +400,6 @@ def parse_ollama_response(text, regex_emails, source_url):
         if isinstance(leads, list):
             return leads
     except json.JSONDecodeError:
-        # Try to fix common JSON issues
         json_str = json_str.replace("'", '"')
         json_str = re.sub(r',\s*]', ']', json_str)
         json_str = re.sub(r',\s*}', '}', json_str)
@@ -354,21 +416,17 @@ def parse_ollama_response(text, regex_emails, source_url):
 
 
 def create_fallback_leads(emails, source_url, business_type=""):
-    """Create basic lead entries from regex-extracted emails.
-    Only keep ONE email per domain, skip if source doesn't match business type."""
+    """Create basic lead entries from regex-extracted emails."""
     domain = clean_website(source_url)
-    
-    # Filter: keep only emails matching the source domain (skip random @randomhouse.com etc)
+
     domain_emails = [e for e in emails if domain and domain.split('.')[0] in e]
-    # If none match domain, just take the first one
     if not domain_emails:
         domain_emails = emails[:1]
-    
-    # Only keep first email per source (one lead per business)
+
     email = domain_emails[0] if domain_emails else None
     if not email:
         return []
-    
+
     return [{
         "name": domain or "Unknown",
         "email": email,
@@ -402,7 +460,6 @@ def is_valid_email(email):
     pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
     if not re.match(pattern, email):
         return False
-    # Skip junk emails
     junk_domains = [
         "example.com", "test.com", "sentry.io", "wixpress.com",
         "w3.org", "schema.org", "googleapis.com", "cloudflare.com",
@@ -431,18 +488,15 @@ def validate_leads(leads, source_url=""):
         website = str(lead.get("website", "not found")).strip()
         description = str(lead.get("description", "not found")).strip()
 
-        # MUST have valid email
         if not is_valid_email(email):
             print(f"    Dropped (no valid email): {name}")
             continue
 
-        # Deduplicate by email
         if email in seen_emails:
             print(f"    Dropped (duplicate): {email}")
             continue
         seen_emails.add(email)
 
-        # Clean website to domain only
         website = clean_website(website)
         if website == "not found" and source_url:
             website = clean_website(source_url)
@@ -486,7 +540,8 @@ def save_to_csv(leads, business_type, region):
 def main():
     print("=" * 60)
     print("  LEAD SCRAPER")
-    print("  SearXNG + Ollama (100% local & open source)")
+    print("  SearXNG + Ollama/Llama (100% local & open source)")
+    print("  Now with AI-powered search query generation!")
     print("=" * 60)
 
     # Check services
@@ -521,6 +576,12 @@ def main():
     max_leads = input("Max leads to find [50]: ").strip()
     max_leads = int(max_leads) if max_leads.isdigit() else 50
 
+    # Ask user: Llama queries or fallback?
+    print(f"\nQuery generation mode:")
+    print(f"  1. AI-powered (Llama generates smart queries) [default]")
+    print(f"  2. Manual (pre-built query templates)")
+    query_mode = input("Choose [1]: ").strip() or "1"
+
     # Location text for queries
     location_names = {
         "us": "United States",
@@ -536,15 +597,21 @@ def main():
     print(f"  Searching: {business_type}")
     print(f"  Region:    {location or 'worldwide'}")
     print(f"  Max leads: {max_leads}")
+    print(f"  Query mode: {'AI (Llama)' if query_mode == '1' else 'Manual'}")
     print(f"{'=' * 60}\n")
 
-    # Build and run queries
-    queries = build_search_queries(business_type, location)
+    # Build queries using Llama or fallback
+    if query_mode == "1":
+        queries = llama_build_queries(business_type, location)
+    else:
+        queries = fallback_queries(business_type, location)
+
+    # Run searches
     all_search_results = []
     seen_urls = set()
 
     for i, query in enumerate(queries, 1):
-        print(f"[{i}/{len(queries)}] Searching: {query[:70]}...")
+        print(f"\n[{i}/{len(queries)}] Searching: {query[:80]}...")
         results = search_searxng(query, region, max_results=20)
         for r in results:
             if r["url"] not in seen_urls:
@@ -640,5 +707,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
