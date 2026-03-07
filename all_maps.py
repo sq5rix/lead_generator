@@ -11,17 +11,8 @@ from bs4 import BeautifulSoup
 from urllib.parse import quote_plus, urlparse, urljoin
 from datetime import datetime
 from cities import US_CITIES
-
-SEARXNG = "http://localhost:8888/search"
-OLLAMA = "http://localhost:11434/api/generate"
-MODEL = "llama3.2"
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
-}
-
-SKIP_DOMAINS = {'amazon.com', 'facebook.com', 'instagram.com', 'twitter.com',
-                'tiktok.com', 'youtube.com', 'wikipedia.org', 'pinterest.com',
-                'linkedin.com', 'x.com'}
+from prompts import generate_queries
+from constants import *
 
 
 def search(query):
@@ -197,14 +188,14 @@ def main():
     for ci, city in enumerate(US_CITIES, 1):
         print(f"\n[{ci}/{len(US_CITIES)}] === {city} === (total leads: {len(leads)})")
 
-        for qt in queries_per_city:
-            query = qt.format(business=business, city=city)
+        queries = generate_queries(business, city)
+        
+        for query in queries:
             results = search(query)
             if results:
                 print(f"  '{query[:60]}' → {len(results)} results")
                 for result in results:
                     process_result(result, seen_domains, seen_emails, leads, city)
-
             time.sleep(random.uniform(1, 2))
 
         # Save progress every 10 cities
