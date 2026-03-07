@@ -1,4 +1,3 @@
-# searxng/settings.yml
 use_default_settings: true
 
 server:
@@ -10,17 +9,3 @@ search:
   formats:
     - html
     - json
-
-engines:
-  - name: google
-    engine: google
-    shortcut: g
-    disabled: false
-  - name: bing
-    engine: bing
-    shortcut: b
-    disabled: false
-  - name: duckduckgo
-    engine: duckduckgo
-    shortcut: ddg
-    disabled: false
